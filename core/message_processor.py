@@ -14,6 +14,7 @@ MessageProcessor - 前台消息处理器
 
 import copy
 from datetime import datetime, timezone, timedelta
+import mimetypes
 from typing import Any, List, Dict
 
 from .utils import format_message_to_text
@@ -158,10 +159,49 @@ class MessageProcessor:
         if not isinstance(original_content, list):
             return []
 
-        return [
-            item for item in original_content
-            if item.get("type") == "image_url"
-        ]
+        image_components = []
+        for item in original_content:
+            if not isinstance(item, dict) or item.get("type") != "image_url":
+                continue
+
+            normalized_item = self._normalize_image_component(item)
+            if normalized_item:
+                image_components.append(normalized_item)
+
+        return image_components
+
+    def _normalize_image_component(self, item: Dict[str, Any]) -> Dict[str, Any] | None:
+        """兼容新旧图片记录格式，确保重建后的组件总是包含可用的 image_url。"""
+        normalized_item = copy.deepcopy(item)
+        image_url = normalized_item.get("image_url", {})
+        if isinstance(image_url, dict):
+            url = image_url.get("url", "")
+            if isinstance(url, str) and url:
+                return normalized_item
+
+        base64_data = normalized_item.get("base64_data", "")
+        mime_type = normalized_item.get("mime_type") or self._guess_image_mime_type(
+            normalized_item.get("original_url", "")
+            or normalized_item.get("original_file_url", "")
+            or normalized_item.get("local_file_path", "")
+        )
+        if isinstance(base64_data, str) and base64_data:
+            normalized_item["image_url"] = {"url": f"data:{mime_type};base64,{base64_data}"}
+            return normalized_item
+
+        for ref_key in ("original_file_url", "local_file_path", "original_url"):
+            ref_value = normalized_item.get(ref_key, "")
+            if isinstance(ref_value, str) and ref_value:
+                normalized_item["image_url"] = {"url": ref_value}
+                return normalized_item
+
+        return None
+
+    def _guess_image_mime_type(self, image_ref: str) -> str:
+        guessed_type, _ = mimetypes.guess_type(image_ref)
+        if guessed_type and guessed_type.startswith("image/"):
+            return guessed_type
+        return "image/jpeg"
 
     def _build_image_refs_text(self, image_components: List[Dict[str, Any]]) -> str:
         """将图片组件中的可用引用拼接为文本，确保历史消息中也可见。"""

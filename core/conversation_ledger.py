@@ -108,9 +108,9 @@ class ConversationLedger:
     async def _download_and_compute_dhash(self, url: str) -> str:
         """下载图片并计算 dHash"""
         try:
+            import os
             # 1. 处理本地文件
             if url.startswith("file:///"):
-                import os
                 path = url[8:]  # 移除 'file:///'
 
                 # 安全检查：验证路径
@@ -136,6 +136,15 @@ class ConversationLedger:
                 else:
                     logger.warning(f"本地文件不存在: {path}")
                     return ""
+
+            elif os.path.exists(url):
+                if os.path.getsize(url) > 10 * 1024 * 1024:
+                    logger.warning(f"文件过大，拒绝处理: {url}")
+                    return ""
+
+                with open(url, "rb") as f:
+                    data = f.read()
+                return self._compute_dhash(data)
 
             # 2. 处理网络文件
             elif url.startswith("http"):
@@ -357,15 +366,6 @@ class ConversationLedger:
                 if abs(message.get("timestamp", 0) - message_timestamp) < 0.001:  # 处理浮点数精度
                     message["image_caption"] = caption
 
-                    # 转述成功后，清空图片URL避免重复转述
-                    if isinstance(message.get("content"), list):
-                        # 移除所有 image_url 组件
-                        message["content"] = [
-                            item for item in message["content"]
-                            if item.get("type") != "image_url"
-                        ]
-                        logger.debug(f"AngelHeart[{chat_id}]: 已清空图片URL，避免重复转述")
-
                     logger.debug(f"AngelHeart[{chat_id}]: 已为消息添加图片转述: {caption[:50]}...")
                     return True
             return False
@@ -425,16 +425,18 @@ class ConversationLedger:
                 image_urls = []
                 for item in message["content"]:
                     if item.get("type") == "image_url":
-                        # 优先使用原始URL
-                        original_url = item.get("original_url")
-                        if original_url and original_url != "[IMAGE_PLACEHOLDER]":
-                            image_urls.append(original_url)
-                            logger.debug(f"AngelHeart[{chat_id}]: 使用原始URL进行转述: {original_url[:100]}...")
-                        else:
-                            # 回退到base64数据URL
-                            image_url = item.get("image_url", {}).get("url", "")
-                            if image_url and not image_url.startswith("data:"):
-                                image_urls.append(image_url)
+                        for candidate in (
+                            item.get("original_url"),
+                            item.get("original_file_url"),
+                            item.get("local_file_path"),
+                            item.get("image_url", {}).get("url", ""),
+                        ):
+                            if isinstance(candidate, str) and candidate and candidate != "[IMAGE_PLACEHOLDER]":
+                                image_urls.append(candidate)
+                                logger.debug(
+                                    f"AngelHeart[{chat_id}]: 使用图片引用进行转述: {candidate[:100]}..."
+                                )
+                                break
 
                 if image_urls:
                     # 我们只处理第一张图片的URL作为缓存键

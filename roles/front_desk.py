@@ -4,11 +4,14 @@ AngelHeart 插件 - 前台角色 (FrontDesk)
 """
 
 import asyncio
+import base64
 import copy
 import json
+import mimetypes
 import os
 import time
 import uuid
+from pathlib import Path
 
 try:
     from astrbot.api import logger
@@ -94,6 +97,97 @@ class FrontDesk:
         except Exception:
             return ""
 
+    def _guess_image_mime_type(self, image_ref: str, image_bytes: bytes | None = None) -> str:
+        """为图片引用推断 MIME，避免将所有图片错误标记为 JPEG。"""
+        if image_bytes:
+            signatures = (
+                (b"\x89PNG\r\n\x1a\n", "image/png"),
+                (b"\xff\xd8\xff", "image/jpeg"),
+                (b"GIF87a", "image/gif"),
+                (b"GIF89a", "image/gif"),
+                (b"RIFF", "image/webp"),
+                (b"BM", "image/bmp"),
+            )
+            for signature, mime_type in signatures:
+                if image_bytes.startswith(signature):
+                    if mime_type == "image/webp" and len(image_bytes) >= 12 and image_bytes[8:12] != b"WEBP":
+                        continue
+                    return mime_type
+
+        if image_ref.startswith("data:"):
+            data_prefix = image_ref.split(";", 1)[0]
+            if data_prefix.startswith("data:image/"):
+                return data_prefix[5:]
+
+        guessed_type, _ = mimetypes.guess_type(image_ref)
+        if guessed_type and guessed_type.startswith("image/"):
+            return guessed_type
+
+        return "image/jpeg"
+
+    async def _serialize_image_component(self, component: Image) -> Dict[str, Any] | None:
+        """保留图片原始引用信息，并仅在必要时构造 data URI。"""
+        raw_ref = component.url or component.file or getattr(component, "path", "") or ""
+        image_item: Dict[str, Any] = {
+            "type": "image_url",
+            "original_url": raw_ref,
+        }
+
+        if raw_ref.startswith(("http://", "https://", "data:")):
+            image_item["image_url"] = {"url": raw_ref}
+            if raw_ref.startswith("data:"):
+                image_item["mime_type"] = self._guess_image_mime_type(raw_ref)
+            return image_item
+
+        local_path = ""
+        if raw_ref.startswith("file:///"):
+            local_path = raw_ref[7:]
+        elif raw_ref and os.path.exists(raw_ref):
+            local_path = os.path.abspath(raw_ref)
+
+        if local_path:
+            try:
+                path_obj = Path(local_path)
+                file_url = path_obj.resolve().as_uri()
+                image_item["local_file_path"] = str(path_obj.resolve())
+                image_item["original_file_url"] = file_url
+                image_item["image_url"] = {"url": file_url}
+                image_item["mime_type"] = self._guess_image_mime_type(str(path_obj))
+                return image_item
+            except Exception:
+                logger.debug(f"AngelHeart: 本地图片路径标准化失败，回退为 base64。raw_ref={raw_ref}")
+
+        base64_data = await component.convert_to_base64()
+        if not base64_data:
+            return None
+
+        cleaned_base64 = (
+            base64_data.replace("base64://", "", 1)
+            if base64_data.startswith("base64://")
+            else base64_data
+        )
+
+        image_bytes = None
+        try:
+            image_bytes = base64.b64decode(cleaned_base64)
+        except Exception:
+            logger.debug("AngelHeart: 图片 base64 解码失败，使用默认 MIME 回退。")
+
+        mime_type = self._guess_image_mime_type(raw_ref, image_bytes)
+        image_item["mime_type"] = mime_type
+        image_item["base64_data"] = cleaned_base64
+        image_item["image_url"] = {"url": f"data:{mime_type};base64,{cleaned_base64}"}
+
+        if raw_ref and os.path.exists(raw_ref):
+            try:
+                path_obj = Path(raw_ref).resolve()
+                image_item["local_file_path"] = str(path_obj)
+                image_item["original_file_url"] = path_obj.as_uri()
+            except Exception:
+                pass
+
+        return image_item
+
     async def cache_message(self, chat_id: str, event: AstrMessageEvent):
         """
         前台职责：使用消息概要作为主要正文，处理图片组件并缓存。
@@ -118,61 +212,28 @@ class FrontDesk:
         # 4. 处理图片组件
         for component in message_chain:
             if isinstance(component, Image):
-                # 尝试使用官方方法处理本地文件或可访问的URL
                 try:
-                    # 检查是否是本地文件或可访问的URL
-                    url = component.url or component.file
-                    if url and (
-                        url.startswith("file:///")
-                        or url.startswith("base64://")
-                        or os.path.exists(url or "")
-                    ):
-                        # 对于本地文件，直接使用官方方法
-                        base64_data = await component.convert_to_base64()
-                        if base64_data:
-                            # 转换为 data URL 格式
-                            if base64_data.startswith("base64://"):
-                                image_data = base64_data.replace("base64://", "")
-                            else:
-                                image_data = base64_data
-                            data_url = f"data:image/jpeg;base64,{image_data}"
-                            content_list.append(
-                                {
-                                    "type": "image_url",
-                                    "image_url": {"url": data_url},
-                                    "original_url": url,  # 保存原始URL供转述使用
-                                    "original_file_url": url,  # 兼容下游统一读取字段
-                                }
-                            )
-                        else:
-                            raise Exception("convert_to_base64 返回空值")
+                    serialized_image = await self._serialize_image_component(component)
+                    if serialized_image:
+                        content_list.append(serialized_image)
                     else:
-                        # 对于网络URL，尝试下载，如果失败则跳过
-                        base64_data = await component.convert_to_base64()
-                        if base64_data:
-                            # 转换为 data URL 格式
-                            if base64_data.startswith("base64://"):
-                                image_data = base64_data.replace("base64://", "")
-                            else:
-                                image_data = base64_data
-                            data_url = f"data:image/jpeg;base64,{image_data}"
-                            content_list.append(
-                                {
-                                    "type": "image_url",
-                                    "image_url": {"url": data_url},
-                                    "original_url": url,  # 保存原始URL供转述使用
-                                    "original_file_url": url,  # 兼容下游统一读取字段
-                                }
-                            )
-                        else:
-                            raise Exception("网络图片下载失败")
+                        raise Exception("图片序列化结果为空")
                 except Exception as e:
-                    # 图片处理失败时，用文本占位符替换，避免传递空或无效URL
-                    original_url = component.url or component.file or "未知URL"
+                    original_url = (
+                        component.url
+                        or component.file
+                        or getattr(component, "path", "")
+                        or "未知URL"
+                    )
                     logger.debug(
                         f"AngelHeart[{chat_id}]: 图片处理跳过，URL: {original_url}, 原因: {str(e)[:100]}"
                     )
-                    # 不添加任何内容，完全跳过图片，保持原有文本消息不变
+                    content_list.append(
+                        {
+                            "type": "text",
+                            "text": f"[图片处理失败: {original_url}]",
+                        }
+                    )
 
         # 5. 如果没有内容，创建一个空文本
         if not content_list:
@@ -207,6 +268,10 @@ class FrontDesk:
         chat_id = event.unified_msg_origin
         current_time = time.time()
         message_content = event.get_message_outline()
+        message_chain = event.get_messages()
+        has_image_component = any(
+            isinstance(component, Image) for component in message_chain
+        )
 
         try:
             self._ensure_internal_event_id(event)
@@ -215,7 +280,7 @@ class FrontDesk:
             await self._check_and_handle_timeout(chat_id, current_time)
 
             # 1. 基本合法性检查 (最高优先级)
-            if not message_content.strip():
+            if not message_content.strip() and not has_image_component:
                 logger.debug(f"AngelHeart[{chat_id}]: 空消息，跳过处理")
                 return
 
@@ -1007,6 +1072,7 @@ class FrontDesk:
         contexts: List[Dict],
         final_prompt: str,
         alias: str,
+        keep_current_images: bool,
         scene_prompt: str | None = None,
     ):
         """更新请求对象"""
@@ -1016,8 +1082,9 @@ class FrontDesk:
         # 聚焦指令并赋值给 req.prompt
         req.prompt = final_prompt
 
-        # 清空 image_urls
-        req.image_urls = []  # 图片已在 contexts 中
+        # 仅在当前 provider 不支持图片，或当前消息已经并入 contexts 时清空 image_urls
+        if not keep_current_images:
+            req.image_urls = []
 
         # 注入系统提示词
         original_system_prompt = getattr(req, "system_prompt", "")
@@ -1041,6 +1108,7 @@ class FrontDesk:
         should_mark_processed = False
         scene_hint = None
         scene_prompt = None
+        provider_supports_images = False
 
         if self._is_group_chat(chat_id):
             # 群聊依赖秘书决策来构造聚焦指令
@@ -1065,20 +1133,43 @@ class FrontDesk:
             if self._is_private_chat(chat_id):
                 scene_prompt = "你正在一个私聊中扮演角色，你的昵称是 '{alias}'。"
 
+        try:
+            provider = self.context.astr_context.get_using_provider(chat_id)
+            if provider:
+                modalities = provider.provider_config.get("modalities", ["text"])
+                provider_supports_images = "image" in modalities
+        except Exception as e:
+            logger.debug(f"AngelHeart[{chat_id}]: 获取 provider modalities 失败，按文本模型保守处理: {e}")
+
+        include_current_event_in_contexts = not provider_supports_images
+        keep_current_images = provider_supports_images
+
         # 2. 标记已处理消息（如果需要）
         self._mark_processed_if_needed(chat_id, recent_dialogue, should_mark_processed)
 
         # 3. 使用 MessageProcessor 构建上下文
         processor = MessageProcessor(alias)
         new_contexts = self._build_contexts_with_processor(
-            processor, historical_context, recent_dialogue, chat_id, current_event_id, scene_hint
+            processor,
+            historical_context,
+            recent_dialogue,
+            chat_id,
+            "" if include_current_event_in_contexts else current_event_id,
+            scene_hint,
         )
 
         # 4. 根据 Provider 的 modalities 配置过滤图片内容
         new_contexts = self.filter_images_for_provider(chat_id, new_contexts)
 
         # 5. 更新请求对象
-        self._update_request(req, new_contexts, final_prompt_str, alias, scene_prompt)
+        self._update_request(
+            req,
+            new_contexts,
+            final_prompt_str,
+            alias,
+            keep_current_images=keep_current_images,
+            scene_prompt=scene_prompt,
+        )
 
         logger.info(
             f"AngelHeart[{chat_id}]: LLM请求体已重构，采用'完整上下文+聚焦指令'模式。"
