@@ -56,8 +56,6 @@ class ConversationLedger:
                 )
             """)
             # 新的 内容哈希 缓存表 (dHash)
-            # 重新建表以确保 Schema 匹配 dHash 格式
-            self.db_cursor.execute("DROP TABLE IF EXISTS image_content_cache")
             self.db_cursor.execute("""
                 CREATE TABLE IF NOT EXISTS image_content_cache (
                     dhash TEXT PRIMARY KEY,
@@ -187,6 +185,40 @@ class ConversationLedger:
                 }
             return self._ledgers[chat_id]
 
+    def _prune_expired_messages(self, chat_id: str):
+        """按 cache_expiry 清理过期消息，但始终保留最近的最小消息数。"""
+        expiry_seconds = max(0, int(self.config_manager.cache_expiry))
+        if expiry_seconds <= 0:
+            return
+
+        ledger = self._get_or_create_ledger(chat_id)
+        with self._lock:
+            messages = ledger["messages"]
+            if len(messages) <= self.MIN_RETAIN_COUNT:
+                return
+
+            cutoff_time = time.time() - expiry_seconds
+            retained_tail = messages[-self.MIN_RETAIN_COUNT :]
+            retained_tail_ids = {id(msg) for msg in retained_tail}
+
+            new_messages = [
+                msg
+                for msg in messages
+                if msg.get("timestamp", 0) >= cutoff_time or id(msg) in retained_tail_ids
+            ]
+
+            if len(new_messages) == len(messages):
+                return
+
+            ledger["messages"] = new_messages
+
+            processed_timestamps = [
+                msg.get("timestamp", 0.0)
+                for msg in new_messages
+                if msg.get("is_processed")
+            ]
+            ledger["last_processed_timestamp"] = max(processed_timestamps, default=0.0)
+
     def add_message(self, chat_id: str, message: Dict, should_prune: bool = False):
         """
         向指定会话添加一条新消息。
@@ -217,6 +249,9 @@ class ConversationLedger:
                 # 保留最新的PER_CHAT_LIMIT条消息
                 ledger["messages"] = ledger["messages"][-self.PER_CHAT_LIMIT:]
 
+        # 1.1 根据时间清理过期消息
+        self._prune_expired_messages(chat_id)
+
         # 2. 估算当前Token并判断是否需要清理
         current_tokens = self._estimate_tokens(chat_id)
         max_tokens = self.config_manager.max_conversation_tokens
@@ -238,6 +273,7 @@ class ConversationLedger:
         Returns:
             消息列表
         """
+        self._prune_expired_messages(chat_id)
         ledger = self._get_or_create_ledger(chat_id)
         with self._lock:
             return ledger["messages"].copy()  # 返回副本避免外部修改

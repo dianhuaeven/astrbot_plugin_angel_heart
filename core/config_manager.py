@@ -36,7 +36,7 @@ class ConfigManager:
     @property
     def cache_expiry(self) -> int:
         """缓存过期时间（秒）"""
-        return self._config.get("cache_expiry", 3600)
+        return self._config.get("cache_expiry", 60)
 
     @property
     def analyzer_model(self) -> str:

@@ -85,6 +85,11 @@ class AngelHeartContext:
         # 主动应答管理器
         self.proactive_manager = ProactiveManager(self)
 
+    def update_config_manager(self, config_manager):
+        """同步更新上下文层持有的配置引用。"""
+        self.config_manager = config_manager
+        self.conversation_ledger.config_manager = config_manager
+
     @property
     def detention_max_wait_time(self) -> float:
         """扣押最长等待时间（秒），来访者愿意等待老板的最长时间"""

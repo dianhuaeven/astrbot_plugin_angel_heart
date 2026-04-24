@@ -278,17 +278,18 @@ class AngelHeartPlugin(Star):
     def reload_config(self, new_config: dict):
         """重新加载配置"""
         self.config_manager = ConfigManager(new_config or {})
+        self.angel_context.update_config_manager(self.config_manager)
+
         # 更新角色实例的配置管理器
         self.secretary.config_manager = self.config_manager
+        self.secretary.status_checker.config_manager = self.config_manager
         self.front_desk.config_manager = self.config_manager
+        self.front_desk.fishing_reply.config_manager = self.config_manager
+
         # 重新加载LLM分析器的配置
         self.secretary.llm_analyzer.reload_config(self.config_manager)
         self._whitelist_cache = self._prepare_whitelist()
 
-        # 更新 ConversationLedger 的缓存过期时间
-        # 注意：这里我们不能直接修改 ConversationLedger 的 cache_expiry
-        # 因为它是初始化时设置的。我们可以考虑重新创建实例或添加一个更新方法
-        # 为了简单，我们暂时只记录日志，实际更新需要更复杂的逻辑
         logger.info(
             f"AngelHeart: 配置已更新。等待时间: {self.config_manager.waiting_time}秒, 缓存过期时间: {self.config_manager.cache_expiry}秒"
         )
